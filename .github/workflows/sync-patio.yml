@@ -1,0 +1,63 @@
+name: Sync Pátio (UCA + Telemetria + SAP)
+
+# Roda o sync_patio_total.py a cada 1 hora.
+# O script lê os bancos externos (MySQL ARMAC + Postgres SAP) e envia o JSON
+# para os webhooks do app (Lovable Cloud) — NÃO escreve direto no Postgres.
+#
+# Secrets do repositório em Settings → Secrets and variables → Actions:
+#   ARMAC_DB_HOST, ARMAC_DB_PORT
+#   ARMAC_DB_USER, ARMAC_DB_PASSWORD          (UCA / fastfield)
+#   TELEMETRIA_DB_USER, TELEMETRIA_DB_PASSWORD (opcional — cai pro ARMAC se não setar)
+#   UCA_DB_NAME (opcional, default: fastfield)
+#   TELEMETRIA_DB_NAME (opcional, default: total_integration)
+#   SAP_DB_HOST, SAP_DB_PORT, SAP_DB_USER, SAP_DB_PASSWORD, SAP_DB_NAME (SAP PM Postgres)
+#   SYNC_WEBHOOK_SECRET  (mesmo valor cadastrado no Lovable Cloud)
+#   APP_BASE_URL         (opcional, default: https://gestaofilialbh.lovable.app)
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-patio
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pymysql==1.1.1 cryptography==43.0.3 psycopg2-binary==2.9.9
+
+      - name: Run sync_patio_total.py
+        env:
+          ARMAC_DB_HOST: ${{ secrets.ARMAC_DB_HOST }}
+          ARMAC_DB_PORT: ${{ secrets.ARMAC_DB_PORT }}
+          ARMAC_DB_USER: ${{ secrets.ARMAC_DB_USER }}
+          ARMAC_DB_PASSWORD: ${{ secrets.ARMAC_DB_PASSWORD }}
+          TELEMETRIA_DB_USER: ${{ secrets.TELEMETRIA_DB_USER }}
+          TELEMETRIA_DB_PASSWORD: ${{ secrets.TELEMETRIA_DB_PASSWORD }}
+          TELEMETRIA_DB_HOST: ${{ secrets.TELEMETRIA_DB_HOST }}
+          TELEMETRIA_DB_PORT: ${{ secrets.TELEMETRIA_DB_PORT }}
+          UCA_DB_NAME: ${{ secrets.UCA_DB_NAME }}
+          TELEMETRIA_DB_NAME: ${{ secrets.TELEMETRIA_DB_NAME }}
+          HANA_DB_HOST: ${{ secrets.HANA_DB_HOST }}
+          HANA_DB_PORT: ${{ secrets.HANA_DB_PORT }}
+          HANA_DB_USER: ${{ secrets.HANA_DB_USER }}
+          HANA_DB_PASSWORD: ${{ secrets.HANA_DB_PASSWORD }}
+          HANA_DB_NAME: ${{ secrets.HANA_DB_NAME }}
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: python sync_patio_total.py
