@@ -885,77 +885,9 @@ def main() -> int:
         print("[SUPR] pulado · HANA_DB_* não configurado", flush=True)
         summary["suprimentos"] = {"ok": True, "skipped": True}
 
-    # --- SUPRIMENTOS COMPRAS (fluxo RC -> PC, alimenta Validação de Pedidos) ---
-    if SAP_ENABLED:
-        started_at = now_utc_iso()
-        try:
-            rows_por_item: dict[tuple[str, str], dict] = {}
-            falhas_janelas: list[str] = []
-            janelas_ok = 0
-            for dias_inicio in range(180, 0, -14):
-                dias_fim = max(0, dias_inicio - 14)
-                janela_rows: list[dict] | None = None
-                ultimo_erro: Exception | None = None
-                for tentativa in range(1, 4):
-                    try:
-                        janela_rows = fetch_postgres(
-                            SAP_DB_NAME,
-                            suprimentos_compras_query(dias_inicio, dias_fim),
-                            SAP_DB_USER,
-                            SAP_DB_PASSWORD,
-                            SAP_DB_HOST,
-                            SAP_DB_PORT,
-                        )
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        ultimo_erro = exc
-                        print(
-                            f"[COMPRAS] janela {dias_inicio}..{dias_fim} tentativa {tentativa}/3 falhou · {exc}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                if janela_rows is None:
-                    falhas_janelas.append(
-                        f"{dias_inicio}..{dias_fim}: {ultimo_erro or 'sem detalhe'}"
-                    )
-                    continue
-                janelas_ok += 1
-                for row in janela_rows:
-                    chave = (
-                        str(row.get("num_rc") or "").strip(),
-                        str(row.get("item_rc") or "").strip(),
-                    )
-                    if all(chave):
-                        rows_por_item[chave] = row
-
-            if janelas_ok == 0:
-                raise RuntimeError(
-                    "todas as janelas RC/PC falharam: "
-                    + (falhas_janelas[0] if falhas_janelas else "sem detalhe")
-                )
-
-            rows = list(rows_por_item.values())
-            payload = {"started_at": started_at, "rows": [to_payload(r) for r in rows]}
-            result = post_json("/api/public/hooks/sync-suprimentos-compras", payload)
-            if not result.get("ok"):
-                raise RuntimeError(f"app respondeu sem ok: {result}")
-            summary["suprimentos_compras"] = result
-            aviso = (
-                f" · {len(falhas_janelas)} janela(s) serão refeitas na próxima execução"
-                if falhas_janelas else ""
-            )
-            print(
-                f"[COMPRAS] ok · {len(rows)} itens RC/PC{aviso} · {result.get('message') or result}",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            summary["suprimentos_compras"] = {"ok": False, "error": str(exc)}
-            print(f"[COMPRAS] erro · {exc}", file=sys.stderr, flush=True)
-            report_failure("/api/public/hooks/sync-suprimentos-compras", started_at, exc)
-            exit_code = 1
-    else:
-        print("[COMPRAS] pulado · HANA_DB_* não configurado", flush=True)
-        summary["suprimentos_compras"] = {"ok": True, "skipped": True}
+    # --- SUPRIMENTOS COMPRAS: agora roda APENAS no workflow dedicado
+    # (sync-compras-rcpc.yml), para nao consultar a replica em dobro a cada hora.
+    summary["suprimentos_compras"] = {"ok": True, "skipped": True, "motivo": "workflow dedicado"}
 
     print(json.dumps(summary, default=str), flush=True)
     return exit_code
