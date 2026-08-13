@@ -159,7 +159,7 @@ def main() -> None:
         dedup[pedido] = item
     lista = list(dedup.values())
 
-    CHUNK = 2000
+    CHUNK = 500
     total = 0
     try:
         if not lista:
