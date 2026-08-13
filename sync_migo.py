@@ -1,13 +1,28 @@
 """
-sync_migo.py — MIGO (recebimento físico) por pedido, do MySQL de requisições de compras.
-Env: MIGO_DB_HOST, MIGO_DB_PORT, MIGO_DB_USER, MIGO_DB_PASSWORD, MIGO_DB_NAME,
-     SYNC_WEBHOOK_SECRET, APP_BASE_URL
+sync_migo.py
+============
+Lê o banco MySQL de requisições de compras (RDS réplica readonly) e envia o
+status de MIGO (recebimento físico) por pedido para o webhook do app:
+
+  POST {APP_BASE_URL}/api/public/hooks/sync-migo
+  Header: x-webhook-secret: {SYNC_WEBHOOK_SECRET}
+  Body:   { "started_at": "...", "rows": [ {pedido, requisicao, data_do_recebimento_fisico, status_migo}, ... ] }
+
+Env necessárias:
+  MIGO_DB_HOST, MIGO_DB_PORT (3306), MIGO_DB_USER, MIGO_DB_PASSWORD, MIGO_DB_NAME
+  SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional)
 """
 from __future__ import annotations
 
 import json
 import os
+# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
+for _k, _v in list(os.environ.items()):
+    if isinstance(_v, str) and _v != _v.strip():
+        os.environ[_k] = _v.strip()
+
 import sys
+import time
 from datetime import datetime, date, timezone
 from decimal import Decimal
 from urllib import request as urlrequest
@@ -16,22 +31,30 @@ from urllib.error import HTTPError, URLError
 import pymysql
 import pymysql.cursors
 
-DB_HOST = os.environ.get("MIGO_DB_HOST") or ""
-DB_PORT = int(os.environ.get("MIGO_DB_PORT") or 3306)
-DB_USER = os.environ.get("MIGO_DB_USER") or ""
-DB_PASSWORD = os.environ.get("MIGO_DB_PASSWORD") or ""
-DB_NAME = os.environ.get("MIGO_DB_NAME") or ""
+DB_HOST = os.environ.get("MIGO_DB_HOST") or os.environ.get("ARMAC_DB_HOST") or ""
+DB_PORT = int(os.environ.get("MIGO_DB_PORT") or os.environ.get("ARMAC_DB_PORT") or 3306)
+DB_USER = os.environ.get("MIGO_DB_USER") or os.environ.get("ARMAC_DB_USER") or ""
+DB_PASSWORD = os.environ.get("MIGO_DB_PASSWORD") or os.environ.get("ARMAC_DB_PASSWORD") or ""
+DB_NAME = os.environ.get("MIGO_DB_NAME") or "requisicoes_compras"
 
 APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "https://gestaofilialbh.lovable.app").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("SYNC_WEBHOOK_SECRET") or ""
 
-if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_NAME]):
-    print("ERRO: MIGO_DB_HOST / MIGO_DB_USER / MIGO_DB_PASSWORD / MIGO_DB_NAME nao definidos", file=sys.stderr)
-    sys.exit(2)
-if not WEBHOOK_SECRET:
-    print("ERRO: SYNC_WEBHOOK_SECRET nao definido", file=sys.stderr)
+if not DB_HOST:
+    print("ERRO: defina MIGO_DB_HOST (ou ARMAC_DB_HOST) nos secrets do GitHub", file=sys.stderr)
     sys.exit(2)
 
+if not DB_USER or not DB_PASSWORD:
+    print("ERRO: defina MIGO_DB_USER/MIGO_DB_PASSWORD (ou ARMAC_DB_USER/ARMAC_DB_PASSWORD)", file=sys.stderr)
+    sys.exit(2)
+
+
+if not WEBHOOK_SECRET:
+    print("ERRO: SYNC_WEBHOOK_SECRET não definido", file=sys.stderr)
+    sys.exit(2)
+
+# Mesma lógica da query do Power BI (Table.Sort por status + Distinct por pedido):
+# ordenamos MIGO FEITA antes de MIGO PENDENTE e mantemos 1 linha por pedido.
 QUERY = """
 WITH main AS (
     SELECT
@@ -64,7 +87,20 @@ def to_jsonable(v):
     return v
 
 
-def post_webhook(payload: dict) -> None:
+def post_webhook(payload: dict, tentativas: int = 4) -> None:
+    for i in range(tentativas):
+        try:
+            _post_webhook_once(payload)
+            return
+        except Exception as e:
+            if i == tentativas - 1:
+                raise
+            espera = 5 * (i + 1)
+            print(f"retry envio em {espera}s ({e})", file=sys.stderr, flush=True)
+            time.sleep(espera)
+
+
+def _post_webhook_once(payload: dict) -> None:
     url = f"{APP_BASE_URL}/api/public/hooks/sync-migo"
     data = json.dumps(payload, default=str).encode("utf-8")
     req = urlrequest.Request(
@@ -104,6 +140,7 @@ def fetch_rows() -> list[dict]:
         except Exception:
             pass
 
+    # Distinct por pedido mantendo a primeira ocorrência (MIGO FEITA vem antes)
     seen: dict[str, dict] = {}
     for r in rows:
         pedido = str(r.get("pedido") or "").strip()
@@ -123,7 +160,7 @@ def main() -> None:
         post_webhook({"started_at": started_at, "error": f"query MySQL: {e}"})
         sys.exit(1)
 
-    CHUNK = 2000
+    CHUNK = 500
     total = 0
     try:
         if not rows:
