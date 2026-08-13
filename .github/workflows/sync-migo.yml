@@ -1,0 +1,45 @@
+name: Sync MIGO (Recebimentos · MySQL)
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-migo
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyMySQL==1.1.1
+      - name: Run sync_migo.py
+        env:
+          MIGO_DB_HOST: ${{ secrets.MIGO_DB_HOST }}
+          MIGO_DB_PORT: ${{ secrets.MIGO_DB_PORT }}
+          MIGO_DB_USER: ${{ secrets.MIGO_DB_USER }}
+          MIGO_DB_PASSWORD: ${{ secrets.MIGO_DB_PASSWORD }}
+          MIGO_DB_NAME: ${{ secrets.MIGO_DB_NAME }}
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: python -u sync_migo.py
+      - name: Notificar falha ao app
+        if: failure()
+        env:
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          BASE="${APP_BASE_URL:-https://gestaofilialbh.lovable.app}"
+          curl -sS -X POST "${BASE%/}/api/public/hooks/sync-migo" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $SYNC_WEBHOOK_SECRET" \
+            -d "{\"error\":\"Workflow GitHub Actions falhou (run ${GITHUB_RUN_ID})\"}" || true

@@ -1,0 +1,52 @@
+name: Sync OS Externas (Spot/Oficinas · SAP)
+
+# Lê as OSs dos responsáveis externos (Heitor 22702 / Paulo Alvarenga 22044)
+# no datalake SAP e envia ao app (módulo Spot · Oficinas Externas).
+
+on:
+  schedule:
+    - cron: "25 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-os-externas
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install psycopg2-binary==2.9.9
+
+      - name: Run sync_os_externas.py
+        env:
+          HANA_DB_HOST: ${{ secrets.HANA_DB_HOST }}
+          HANA_DB_PORT: ${{ secrets.HANA_DB_PORT }}
+          HANA_DB_USER: ${{ secrets.HANA_DB_USER }}
+          HANA_DB_PASSWORD: ${{ secrets.HANA_DB_PASSWORD }}
+          HANA_DB_NAME: ${{ secrets.HANA_DB_NAME }}
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: python -u sync_os_externas.py
+
+      - name: Notificar falha ao app
+        if: failure()
+        env:
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          BASE="${APP_BASE_URL:-https://gestaofilialbh.lovable.app}"
+          curl -sS -X POST "${BASE%/}/api/public/hooks/sync-os-externas" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $SYNC_WEBHOOK_SECRET" \
+            -d "{\"error\":\"Workflow GitHub Actions falhou (run ${GITHUB_RUN_ID})\"}" || true
