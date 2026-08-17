@@ -4,12 +4,12 @@ sync_compras_historico.py
 Histórico AMPLIADO de pedidos de compra (PC) do SAP, usado para sugerir
 fornecedores/preços/lead time no Painel da Compradora.
 
-Diferente do sync_compras_rcpc.py (fluxo RC→PC recente, filtrado por grupo de
-compras), aqui puxamos TODOS os itens de pedido (EKPO/EKKO) de uma janela longa
-(padrão 1095 dias = 3 anos), para ter base estatística de preço e prazo.
-
   POST {APP_BASE_URL}/api/public/hooks/sync-compras-historico
   Header: x-webhook-secret: {SYNC_WEBHOOK_SECRET}
+
+Env: HANA_DB_HOST/PORT/USER/PASSWORD/NAME (ou SAP_DB_*),
+     SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional),
+     COMPRAS_HIST_DIAS (1095), COMPRAS_HIST_JANELA (30)
 """
 from __future__ import annotations
 
@@ -24,12 +24,12 @@ from urllib.error import HTTPError, URLError
 import psycopg2
 import psycopg2.extras
 
-DB_HOST = os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or ""
-_p = os.environ.get("HANA_DB_PORT") or os.environ.get("SAP_DB_PORT")
+DB_HOST = (os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or "").strip()
+_p = (os.environ.get("HANA_DB_PORT") or os.environ.get("SAP_DB_PORT") or "").strip()
 DB_PORT = int(_p) if _p else 5432
-DB_USER = os.environ.get("HANA_DB_USER") or os.environ.get("SAP_DB_USER") or ""
+DB_USER = (os.environ.get("HANA_DB_USER") or os.environ.get("SAP_DB_USER") or "").strip()
 DB_PASSWORD = os.environ.get("HANA_DB_PASSWORD") or os.environ.get("SAP_DB_PASSWORD") or ""
-DB_NAME = os.environ.get("HANA_DB_NAME") or os.environ.get("SAP_DB_NAME") or ""
+DB_NAME = (os.environ.get("HANA_DB_NAME") or os.environ.get("SAP_DB_NAME") or "").strip()
 
 APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "https://gestaofilialbh.lovable.app").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("SYNC_WEBHOOK_SECRET") or ""
@@ -97,6 +97,22 @@ def post_webhook(payload: dict) -> None:
     raise RuntimeError("webhook falhou após 3 tentativas")
 
 
+def diagnostico_host() -> None:
+    import socket
+
+    bruto = os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or ""
+    print(
+        f"host: len_bruto={len(bruto)} len_limpo={len(DB_HOST)} "
+        f"tem_espaco={' ' in bruto.strip()} tem_quebra={chr(10) in bruto or chr(13) in bruto} "
+        f"porta={DB_PORT}"
+    )
+    try:
+        socket.getaddrinfo(DB_HOST, DB_PORT)
+        print("DNS ok")
+    except Exception as e:
+        print("DNS falhou:", e)
+
+
 def conectar():
     return psycopg2.connect(
         host=DB_HOST,
@@ -106,6 +122,7 @@ def conectar():
         dbname=DB_NAME,
         connect_timeout=30,
         sslmode=os.environ.get("HANA_DB_SSLMODE") or "prefer",
+        options="-c statement_timeout=600000",
     )
 
 
@@ -132,10 +149,14 @@ def buscar_janela(ini: int, fim: int) -> list[dict]:
 
 
 def main() -> int:
+    if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_NAME]):
+        print("HANA_DB_* (ou SAP_DB_*) incompletos")
+        return 1
     if not WEBHOOK_SECRET:
         print("SYNC_WEBHOOK_SECRET ausente")
         return 1
     started_at = datetime.now(timezone.utc).isoformat()
+    diagnostico_host()
 
     vistos: set[str] = set()
     buffer: list[dict] = []
@@ -166,6 +187,10 @@ def main() -> int:
         try:
             rows = buscar_janela(ini, fim)
         except Exception as e:
+            if "could not translate host name" in str(e):
+                raise RuntimeError(
+                    "HANA_DB_HOST inválido: informe somente o hostname, sem https://, porta, aspas ou quebra de linha"
+                ) from e
             falhas.append(str(e))
             ini -= JANELA
             continue
