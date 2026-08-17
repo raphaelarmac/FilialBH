@@ -2,7 +2,7 @@
 sync_os_externas.py
 ===================
 Lê no datalake SAP as OSs de manutenção dos responsáveis externos
-(Heitor 22702 e Paulo Alvarenga 22044) — query FINAL v6 de 12/08/2026 —
+(Heitor 22702 e Paulo Alvarenga 22044) — query v7 (com criticidade) —
 e envia 1 linha por ORDEM (com as operações aninhadas) ao webhook do app:
 
   POST {APP_BASE_URL}/api/public/hooks/sync-os-externas
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+
 # Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
 for _k, _v in list(os.environ.items()):
     if isinstance(_v, str) and _v != _v.strip():
@@ -49,7 +50,7 @@ if not WEBHOOK_SECRET:
 
 # =====================================================================
 # OS de Manutenção - Heitor (22702) e Paulo Alvarenga (22044)
-# Datalake SAP (sintaxe PostgreSQL) - FINAL v6 - 12/08/2026
+# Datalake SAP (sintaxe PostgreSQL) - v7 - criticidade via AFIH.PRIOK
 # =====================================================================
 QUERY = """
 WITH base_os AS (
@@ -67,6 +68,17 @@ WITH base_os AS (
     AFIH.maintordpersonresponsible AS cod_responsavel,
     RESP.ename      AS responsavel,
     AFIH.ILART      AS tipo_manutencao_real,
+
+    -- >>> CRITICIDADE / PRIORIDADE DA OS <<<
+    AFIH.PRIOK      AS priok,
+    CASE TRIM(BOTH FROM COALESCE(AFIH.PRIOK::text, ''))
+      WHEN '1' THEN 'Urgente'
+      WHEN '2' THEN 'Alta'
+      WHEN '3' THEN 'Média'
+      WHEN '4' THEN 'Baixa'
+      ELSE NULL
+    END AS desc_prioridade,
+
     CASE
       WHEN AFIH.ILART LIKE '%PRP%' THEN 'Preparação'
       WHEN AFIH.ILART LIKE '%OFI%' THEN 'Oficina'
@@ -153,6 +165,8 @@ SELECT
   OS.tipo_manutencao,
   OS.tipo_manutencao_real,
   OS.descricao_os,
+  OS.priok,
+  OS.desc_prioridade,
   OS.centro_trabalho_cabecalho    AS centro_trabalho_responsavel,
   OS.cod_responsavel,
   OS.responsavel,
@@ -200,7 +214,7 @@ def post_webhook(payload: dict) -> None:
     )
     try:
         with urlrequest.urlopen(req, timeout=180) as resp:
-            print(f"webhook {resp.status}: {resp.read()[:120].decode('utf-8', 'ignore')}", flush=True)
+            print(f"webhook {resp.status}: {resp.read()[:300].decode('utf-8', 'ignore')}", flush=True)
     except HTTPError as e:
         print(f"HTTP {e.code}: {e.read()[:400].decode('utf-8', 'ignore')}", file=sys.stderr, flush=True)
         raise
@@ -247,8 +261,25 @@ def fetch_rows() -> list[dict]:
     raise last  # type: ignore[misc]
 
 
+def _txt(v) -> str | None:
+    if v is None:
+        return None
+    t = str(v).strip()
+    return t or None
+
+
+def _criticidade(priok, descricao=None) -> str | None:
+    """Traduz o PRIOK do SAP; se ja veio texto valido, mantem."""
+    descricao_txt = _txt(descricao)
+    if descricao_txt:
+        return descricao_txt
+    codigo = (_txt(priok) or "").lstrip("0")
+    return {"1": "Urgente", "2": "Alta", "3": "Média", "4": "Baixa"}.get(codigo)
+
+
 def main() -> None:
     started_at = datetime.now(timezone.utc).isoformat()
+
     try:
         raw = fetch_rows()
     except Exception as e:
@@ -265,6 +296,8 @@ def main() -> None:
             continue
         o = ordens.get(ordem)
         if not o:
+            priok = _txt(r.get("priok"))
+            criticidade = _criticidade(priok, r.get("desc_prioridade"))
             o = {
                 "ordem": ordem,
                 "ativo": to_jsonable(r.get("ativo")),
@@ -275,6 +308,10 @@ def main() -> None:
                 "tipo_manutencao": to_jsonable(r.get("tipo_manutencao")),
                 "tipo_manutencao_real": to_jsonable(r.get("tipo_manutencao_real")),
                 "descricao_os": to_jsonable(r.get("descricao_os")),
+                # criticidade + aliases aceitos pelo webhook
+                "criticidade": criticidade,
+                "desc_prioridade": criticidade,
+                "priok": priok,
                 "centro_trabalho": to_jsonable(r.get("centro_trabalho_responsavel")),
                 "cod_responsavel": str(r.get("cod_responsavel") or "").strip().lstrip("0") or None,
                 "responsavel": to_jsonable(r.get("responsavel")),
@@ -290,6 +327,15 @@ def main() -> None:
                 "operacoes": [],
             }
             ordens[ordem] = o
+        else:
+            # linhas repetidas por operacao: nao deixa linha vazia apagar a criticidade
+            if not o.get("priok"):
+                o["priok"] = _txt(r.get("priok"))
+            if not o.get("criticidade"):
+                c = _criticidade(o.get("priok"), r.get("desc_prioridade"))
+                o["criticidade"] = c
+                o["desc_prioridade"] = c
+
         num_op = r.get("num_operacao")
         if num_op is not None and str(num_op).strip():
             op = {
@@ -302,13 +348,15 @@ def main() -> None:
                 o["operacoes"].append(op)
 
     lista = list(ordens.values())
-    print(f"{len(lista)} ordens agrupadas", flush=True)
+    com_crit = sum(1 for o in lista if o.get("criticidade"))
+    print(f"{len(lista)} ordens agrupadas ({com_crit} com criticidade)", flush=True)
 
     CHUNK = 300
     total = 0
     try:
         if not lista:
             post_webhook({"started_at": started_at, "rows": [], "is_last": True})
+
         for i in range(0, len(lista), CHUNK):
             buf = lista[i:i + CHUNK]
             post_webhook({
