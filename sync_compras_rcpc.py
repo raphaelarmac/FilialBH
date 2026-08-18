@@ -21,11 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 import sys
 import time
 from datetime import datetime, timezone
@@ -146,8 +141,10 @@ WHERE (
     OR K.EKGRP IN ('201', '220', '251')
     OR K.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
   )
-  AND E.BADAT >= TO_CHAR(CURRENT_DATE - %(ini)s::int, 'YYYYMMDD')
-  AND E.BADAT <= TO_CHAR(CURRENT_DATE - %(fim)s::int, 'YYYYMMDD')
+  -- BADAT precisa de cast pra date: comparar como texto ('YYYYMMDD') derruba
+  -- as linhas gravadas no formato 'YYYY-MM-DD' e some com as RCs do dia.
+  AND E.BADAT::date >= CURRENT_DATE - %(ini)s::int
+  AND E.BADAT::date <= CURRENT_DATE - %(fim)s::int
   AND TRIM(LEADING '0' FROM TRIM(E.MATNR)) <> ''
 ORDER BY E.BANFN ASC
 """
