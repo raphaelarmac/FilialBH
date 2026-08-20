@@ -1,0 +1,29 @@
+name: Sync Contrato dos Ativos (SPOT × Longo Prazo)
+
+# Chama o app, que lê fi_contratos_itens_v2 na réplica SAP e atualiza
+# public.ativo_contrato. Contrato muda pouco: 1x por dia basta.
+
+on:
+  schedule:
+    - cron: "10 4 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-ativo-contrato
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Disparar sync no app
+        env:
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          BASE="${APP_BASE_URL:-https://gestaofilialbh.lovable.app}"
+          curl -sS --fail-with-body -X POST "${BASE%/}/api/public/hooks/sync-ativo-contrato" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: $SYNC_WEBHOOK_SECRET" \
+            -d '{}'
