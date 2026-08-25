@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
+for _k, _v in list(os.environ.items()):
+    if isinstance(_v, str) and _v != _v.strip():
+        os.environ[_k] = _v.strip()
 import sys
 import traceback
 from datetime import date, datetime
