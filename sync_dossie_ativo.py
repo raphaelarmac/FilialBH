@@ -20,6 +20,7 @@ import os
 for _k, _v in list(os.environ.items()):
     if isinstance(_v, str) and _v != _v.strip():
         os.environ[_k] = _v.strip()
+
 import sys
 import traceback
 from datetime import date, datetime
@@ -156,9 +157,12 @@ def main() -> int:
         print("ERRO: variáveis obrigatórias ausentes", file=sys.stderr)
         return 2
 
+    # A replica do SAP usa certificado auto-assinado. Os outros 8 robôs conectam
+    # com "prefer" (tenta TLS e cai pra conexao normal se o servidor recusar).
+    # Com "require" a conexao morre antes da primeira consulta.
     conn = psycopg2.connect(
         host=HOST, port=PORT, user=USER, password=PASSWORD, dbname=DBNAME,
-        sslmode="require", connect_timeout=30,
+        sslmode=os.environ.get("HANA_DB_SSLMODE") or "prefer", connect_timeout=30,
     )
     conn.set_session(readonly=True, autocommit=True)
     with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -196,6 +200,7 @@ def main() -> int:
         f"ativo={ATIVO} ordens={len(ordens)} pedidos={len(pedidos)} "
         f"reservas={len(reservas)} consumo={len(consumo)} makt={len(makt)}"
     )
+
     post({
         "job_id": JOB_ID,
         "ativo": ATIVO,
