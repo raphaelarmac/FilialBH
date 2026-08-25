@@ -145,7 +145,12 @@ def post(payload: dict) -> None:
     req = urlrequest.Request(
         f"{APP_BASE_URL}/api/public/hooks/dossie-ativo-data",
         data=body,
-        headers={"Content-Type": "application/json", "x-webhook-secret": SECRET},
+        headers={
+            "Content-Type": "application/json",
+            "x-webhook-secret": SECRET,
+            # Sem User-Agent de navegador o Cloudflare do app devolve 403.
+            "User-Agent": "Mozilla/5.0 (compatible; ArmacSync/1.0)",
+        },
         method="POST",
     )
     with urlrequest.urlopen(req, timeout=180) as resp:
@@ -159,7 +164,6 @@ def main() -> int:
 
     # A replica do SAP usa certificado auto-assinado. Os outros 8 robôs conectam
     # com "prefer" (tenta TLS e cai pra conexao normal se o servidor recusar).
-    # Com "require" a conexao morre antes da primeira consulta.
     conn = psycopg2.connect(
         host=HOST, port=PORT, user=USER, password=PASSWORD, dbname=DBNAME,
         sslmode=os.environ.get("HANA_DB_SSLMODE") or "prefer", connect_timeout=30,
