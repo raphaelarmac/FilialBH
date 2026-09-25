@@ -13,11 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 import sys
 import time
 import traceback
@@ -105,10 +100,14 @@ lotes_ewm_agrupados AS (
         SELECT
             material,
             lote,
-            SUM(quantidade) AS qtd_lote,
-            STRING_AGG(DISTINCT posicao, ' | ') AS posicoes
-        FROM ewm_base
-        WHERE material IN (SELECT material_limpo FROM materiais_base)
+            SUM(qtd_pos) AS qtd_lote,
+            STRING_AGG(posicao || ' [' || RTRIM(TO_CHAR(qtd_pos, 'FM999999990.###'), '.') || ']', ' | ' ORDER BY qtd_pos DESC) AS posicoes
+        FROM (
+            SELECT material, lote, posicao, SUM(quantidade) AS qtd_pos
+            FROM ewm_base
+            WHERE material IN (SELECT material_limpo FROM materiais_base)
+            GROUP BY material, lote, posicao
+        ) pp
         GROUP BY material, lote
     ) sub
     GROUP BY material
