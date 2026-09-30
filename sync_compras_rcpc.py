@@ -30,14 +30,6 @@ from urllib.error import HTTPError, URLError
 import psycopg2
 import psycopg2.extras
 
-# Secrets colados no GitHub às vezes vêm com um espaço ou uma quebra de linha no
-# fim (um "enter" sobrando). Isso faz a autenticação no SAP falhar com
-# `password authentication failed for user "usuario\n"`. Removemos espaços e
-# quebras de TODAS as variáveis de ambiente antes de qualquer uso.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 DB_HOST = os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or ""
 _p = os.environ.get("HANA_DB_PORT") or os.environ.get("SAP_DB_PORT")
 DB_PORT = int(_p) if _p else 5432
@@ -60,11 +52,6 @@ if not WEBHOOK_SECRET:
     sys.exit(2)
 
 # Mesma lógica do sync interno (src/server/compras-sync.server.ts).
-#
-# Campos de atendimento parcial (qtd_rc / qtd_atendida_rc / qtd_pendente_rc):
-# somam TODOS os pedidos não cancelados do item da RC via window function sobre
-# o LEFT JOIN EKPO já existente (custo zero de leitura extra) para que uma RC
-# atendida só em parte continue aparecendo como pendência no Painel de Compras.
 QUERY = """
 SELECT
   COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
@@ -106,17 +93,6 @@ SELECT
     ELSE 'Outro'
   END AS tipo_consumo,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(PK.KOSTL, ACC.KOSTL, ''))),'') AS centro_custo,
-  E.MENGE AS qtd_rc,
-  COALESCE(
-    SUM(CASE WHEN COALESCE(TRIM(P.LOEKZ),'') <> 'L' THEN P.MENGE END)
-      OVER (PARTITION BY E.BANFN, E.BNFPO),
-    0) AS qtd_atendida_rc,
-  GREATEST(
-    E.MENGE - COALESCE(
-      SUM(CASE WHEN COALESCE(TRIM(P.LOEKZ),'') <> 'L' THEN P.MENGE END)
-        OVER (PARTITION BY E.BANFN, E.BNFPO),
-      0),
-    0) AS qtd_pendente_rc,
   CASE
     -- A exclusao da RC e soberana, mesmo quando existe historico de pedido,
     -- aprovacao ou recebimento para o item.
