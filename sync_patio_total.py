@@ -49,6 +49,8 @@ for _k, _v in list(os.environ.items()):
         os.environ[_k] = _v.strip()
 
 
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -351,10 +353,6 @@ ORDER BY itens.ativo, itens.ordem, itens.num_operacao;
 # Fluxo completo RC -> PC dos grupos de compradores da filial (201/220/251)
 # e dos compradores nominais. Cobre pedidos com OS (ativo do equipamento) e
 # pedidos de estoque/centro de custo (ativo 'ESTOQUE').
-#
-# Campos de atendimento parcial (qtd_rc / qtd_atendida_rc / qtd_pendente_rc):
-# somam TODOS os pedidos não cancelados do item da RC (join PQ) para que uma RC
-# atendida só em parte continue aparecendo como pendência no Painel de Compras.
 SUPRIMENTOS_COMPRAS_QUERY = """
 SELECT
   COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
@@ -398,9 +396,6 @@ SELECT
     ELSE 'Outro'
   END AS tipo_consumo,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(PK.KOSTL, ACC.KOSTL, ''))),'') AS centro_custo,
-  E.MENGE AS qtd_rc,
-  COALESCE(PQ.qtd_pedida, 0) AS qtd_atendida_rc,
-  GREATEST(E.MENGE - COALESCE(PQ.qtd_pedida, 0), 0) AS qtd_pendente_rc,
   CASE
     -- A exclusao da RC e soberana, mesmo quando existe historico de pedido,
     -- aprovacao ou recebimento para o item.
@@ -419,16 +414,6 @@ SELECT
 FROM EBAN AS E
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
-LEFT JOIN (
-  -- Soma dos pedidos NAO cancelados por item de RC, agregada UMA vez e ligada
-  -- por hash join (igual ao LEFT JOIN EKPO acima). Um LATERAL correlacionado
-  -- aqui varria a EKPO inteira por linha e derrubava a conexao da replica.
-  SELECT BANFN, BNFPO, SUM(MENGE) AS qtd_pedida
-  FROM EKPO
-  WHERE COALESCE(TRIM(LOEKZ),'') <> 'L'
-    AND COALESCE(TRIM(BANFN),'') <> ''
-  GROUP BY BANFN, BNFPO
-) AS PQ ON PQ.BANFN = E.BANFN AND PQ.BNFPO = E.BNFPO
 LEFT JOIN LATERAL (
   SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
   FROM EBKN
