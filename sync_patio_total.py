@@ -22,11 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -268,11 +263,20 @@ itens_brutos AS (
         LTRIM(TRIM(P.EBELN), '0') AS pedido,
         CAST(NULL AS VARCHAR) AS num_reserva,
         'compra'::text AS origem,
-        E.KNTTP AS knttp
+        E.KNTTP AS knttp,
+        TRIM(COALESCE(RX.VORNR, '')) AS num_operacao
     FROM ultima_os os
     JOIN EBKN ACC ON ACC.AUFNR = os.ordem_sap
     JOIN EBAN E   ON E.BANFN = ACC.BANFN AND E.BNFPO = ACC.BNFPO
-    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO
+    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO AND COALESCE(TRIM(P.LOEKZ),'') <> 'L'
+    LEFT JOIN LATERAL (
+        SELECT MAX(TRIM(R2.VORNR)) AS VORNR
+        FROM RESB R2
+        WHERE R2.AUFNR = os.ordem_sap
+          AND LTRIM(TRIM(R2.MATNR), '0') = LTRIM(TRIM(E.MATNR), '0')
+          AND TRIM(COALESCE(R2.VORNR,'')) <> ''
+    ) RX ON TRUE
+
 
     UNION ALL
 
@@ -291,20 +295,21 @@ itens_brutos AS (
             WHEN R.POSTP = 'N' THEN 'compra'::text
             ELSE 'reserva'::text
         END AS origem,
-        E.KNTTP AS knttp
+        E.KNTTP AS knttp,
+        TRIM(COALESCE(OPR.VORNR, R.VORNR, '')) AS num_operacao
     FROM ultima_os os
     JOIN RESB R   ON R.AUFNR = os.ordem_sap
     LEFT JOIN EBAN E ON E.BANFN = R.BANFN AND E.BNFPO = R.BNFPO
-    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO
+    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO AND COALESCE(TRIM(P.LOEKZ),'') <> 'L'
+    LEFT JOIN AFVC OPR ON OPR.AUFPL = R.AUFPL AND OPR.APLZL = R.APLZL
     WHERE (R.XLOEK IS NULL OR TRIM(R.XLOEK) = '')
 ),
 itens_deduplicados AS (
     SELECT
         *,
         ROW_NUMBER() OVER (
-            PARTITION BY ordem, cod_sap
+            PARTITION BY ordem, cod_sap, num_operacao, origem
             ORDER BY
-                CASE WHEN origem = 'compra' THEN 1 ELSE 2 END,
                 CASE WHEN pedido IS NOT NULL THEN 1 ELSE 2 END,
                 CASE WHEN num_reserva IS NOT NULL THEN 1 ELSE 2 END
         ) AS rn
@@ -320,6 +325,7 @@ SELECT
     itens.num_reserva   AS num_reserva,
     itens.pedido        AS pedido,
     itens.origem        AS origem,
+    itens.num_operacao  AS num_operacao,
     NULLIF(TRIM(COALESCE(itens.knttp,'')),'') AS knttp,
     CASE
         WHEN COALESCE(TRIM(itens.knttp),'') = '' THEN 'estoque'
@@ -329,13 +335,18 @@ SELECT
 FROM itens_deduplicados itens
 LEFT JOIN MAKT M ON LTRIM(TRIM(M.MATNR), '0') = itens.cod_sap AND M.SPRAS IN ('P', 'PT')
 WHERE itens.rn = 1
-ORDER BY itens.ativo, itens.ordem;
+ORDER BY itens.ativo, itens.ordem, itens.num_operacao;
+
 """
 
 
 # Fluxo completo RC -> PC dos grupos de compradores da filial (201/220/251)
 # e dos compradores nominais. Cobre pedidos com OS (ativo do equipamento) e
 # pedidos de estoque/centro de custo (ativo 'ESTOQUE').
+#
+# Campos de atendimento parcial (qtd_rc / qtd_atendida_rc / qtd_pendente_rc):
+# somam TODOS os pedidos não cancelados do item da RC (join PQ) para que uma RC
+# atendida só em parte continue aparecendo como pendência no Painel de Compras.
 SUPRIMENTOS_COMPRAS_QUERY = """
 SELECT
   COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
@@ -346,7 +357,7 @@ SELECT
   ) AS ordem,
   TRIM(LEADING '0' FROM TRIM(E.MATNR)) AS cod_sap,
   COALESCE(M.MAKTX, E.TXZ01) AS descricao,
-  COALESCE(P.MENGE, E.MENGE) AS qtd_req,
+  CASE WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' OR COALESCE(P.MENGE,0) = 0 THEN E.MENGE ELSE P.MENGE END AS qtd_req,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(P.EBELN,''))),'') AS pedido,
   CAST(NULL AS VARCHAR) AS num_reserva,
   'compra'::text AS origem,
@@ -379,7 +390,14 @@ SELECT
     ELSE 'Outro'
   END AS tipo_consumo,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(PK.KOSTL, ACC.KOSTL, ''))),'') AS centro_custo,
+  E.MENGE AS qtd_rc,
+  COALESCE(PQ.qtd_pedida, 0) AS qtd_atendida_rc,
+  GREATEST(E.MENGE - COALESCE(PQ.qtd_pedida, 0), 0) AS qtd_pendente_rc,
   CASE
+    -- A exclusao da RC e soberana, mesmo quando existe historico de pedido,
+    -- aprovacao ou recebimento para o item.
+    WHEN TRIM(COALESCE(E.LOEKZ,'')) IN ('X','L')
+      AND (P.EBELN IS NULL OR TRIM(COALESCE(P.LOEKZ,'')) = 'L') THEN 'rc_excluida'
     WHEN COALESCE(H.qtd_recebida, 0) >= P.MENGE AND P.MENGE > 0
       THEN 'recebido'
     WHEN COALESCE(H.qtd_recebida, 0) > 0
@@ -387,13 +405,18 @@ SELECT
     WHEN K.FRGRL = 'X' THEN 'aguardando_aprovacao'
     WHEN P.EBELN IS NOT NULL AND COALESCE(TRIM(P.LOEKZ),'') <> 'L' THEN 'pedido_emitido'
     WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' THEN 'pedido_cancelado'
-    WHEN TRIM(COALESCE(E.LOEKZ,'')) = 'X' THEN 'rc_excluida'
     WHEN E.BANFN IS NOT NULL AND COALESCE(TRIM(P.EBELN),'') = '' THEN 'aguardando_pedido'
     ELSE 'verificar'
   END AS status_processo
 FROM EBAN AS E
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
+LEFT JOIN LATERAL (
+  SELECT SUM(P2.MENGE) AS qtd_pedida
+  FROM EKPO P2
+  WHERE P2.BANFN = E.BANFN AND P2.BNFPO = E.BNFPO
+    AND COALESCE(TRIM(P2.LOEKZ),'') <> 'L'
+) AS PQ ON TRUE
 LEFT JOIN LATERAL (
   SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
   FROM EBKN
@@ -518,12 +541,11 @@ HORIMETRO_QUERY = """
 
 # Leituras que o pipeline da telemetria rejeitou (ex.: HOURMETER_NEGATIVE após
 # troca de rastreador). O horímetro não é confiável, mas PROVA que o ativo
-# está comunicando — usamos só como data de comunicação.
+# está comunicando — usamos estritamente só como data e diagnóstico.
 HORIMETRO_INVALIDO_QUERY = """
     SELECT
         UPPER(TRIM(i.armac_code))  AS n_armac,
         i.event_datetime           AS comunicacao_rastreador_em,
-        i.hourmeter                AS horimetro_rastreador,
         i.source                   AS fonte_rastreador,
         i.error_code               AS motivo_rastreador
     FROM total_integration.hourmeter_invalid i
@@ -751,7 +773,9 @@ def main() -> int:
                     por_ativo[k] = alvo
                     rows_payload.append(alvo)
                 alvo["comunicacao_rastreador_em"] = p.get("comunicacao_rastreador_em")
-                alvo["horimetro_rastreador"] = p.get("horimetro_rastreador")
+                # Nunca propagar i.hourmeter: esta linha existe justamente
+                # porque o pipeline classificou a leitura como inválida.
+                alvo["horimetro_rastreador"] = None
                 alvo["fonte_rastreador"] = p.get("fonte_rastreador")
                 alvo["motivo_rastreador"] = p.get("motivo_rastreador")
             print(f"[TELE] {len(inval)} leituras rejeitadas mescladas", flush=True)
@@ -885,9 +909,77 @@ def main() -> int:
         print("[SUPR] pulado · HANA_DB_* não configurado", flush=True)
         summary["suprimentos"] = {"ok": True, "skipped": True}
 
-    # --- SUPRIMENTOS COMPRAS: agora roda APENAS no workflow dedicado
-    # (sync-compras-rcpc.yml), para nao consultar a replica em dobro a cada hora.
-    summary["suprimentos_compras"] = {"ok": True, "skipped": True, "motivo": "workflow dedicado"}
+    # --- SUPRIMENTOS COMPRAS (fluxo RC -> PC, alimenta Validação de Pedidos) ---
+    if SAP_ENABLED:
+        started_at = now_utc_iso()
+        try:
+            rows_por_item: dict[tuple[str, str], dict] = {}
+            falhas_janelas: list[str] = []
+            janelas_ok = 0
+            for dias_inicio in range(180, 0, -14):
+                dias_fim = max(0, dias_inicio - 14)
+                janela_rows: list[dict] | None = None
+                ultimo_erro: Exception | None = None
+                for tentativa in range(1, 4):
+                    try:
+                        janela_rows = fetch_postgres(
+                            SAP_DB_NAME,
+                            suprimentos_compras_query(dias_inicio, dias_fim),
+                            SAP_DB_USER,
+                            SAP_DB_PASSWORD,
+                            SAP_DB_HOST,
+                            SAP_DB_PORT,
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        ultimo_erro = exc
+                        print(
+                            f"[COMPRAS] janela {dias_inicio}..{dias_fim} tentativa {tentativa}/3 falhou · {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                if janela_rows is None:
+                    falhas_janelas.append(
+                        f"{dias_inicio}..{dias_fim}: {ultimo_erro or 'sem detalhe'}"
+                    )
+                    continue
+                janelas_ok += 1
+                for row in janela_rows:
+                    chave = (
+                        str(row.get("num_rc") or "").strip(),
+                        str(row.get("item_rc") or "").strip(),
+                    )
+                    if all(chave):
+                        rows_por_item[chave] = row
+
+            if janelas_ok == 0:
+                raise RuntimeError(
+                    "todas as janelas RC/PC falharam: "
+                    + (falhas_janelas[0] if falhas_janelas else "sem detalhe")
+                )
+
+            rows = list(rows_por_item.values())
+            payload = {"started_at": started_at, "rows": [to_payload(r) for r in rows]}
+            result = post_json("/api/public/hooks/sync-suprimentos-compras", payload)
+            if not result.get("ok"):
+                raise RuntimeError(f"app respondeu sem ok: {result}")
+            summary["suprimentos_compras"] = result
+            aviso = (
+                f" · {len(falhas_janelas)} janela(s) serão refeitas na próxima execução"
+                if falhas_janelas else ""
+            )
+            print(
+                f"[COMPRAS] ok · {len(rows)} itens RC/PC{aviso} · {result.get('message') or result}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            summary["suprimentos_compras"] = {"ok": False, "error": str(exc)}
+            print(f"[COMPRAS] erro · {exc}", file=sys.stderr, flush=True)
+            report_failure("/api/public/hooks/sync-suprimentos-compras", started_at, exc)
+            exit_code = 1
+    else:
+        print("[COMPRAS] pulado · HANA_DB_* não configurado", flush=True)
+        summary["suprimentos_compras"] = {"ok": True, "skipped": True}
 
     print(json.dumps(summary, default=str), flush=True)
     return exit_code
