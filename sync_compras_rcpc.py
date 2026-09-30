@@ -21,11 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 import sys
 import time
 from datetime import datetime, timezone
@@ -57,6 +52,10 @@ if not WEBHOOK_SECRET:
     sys.exit(2)
 
 # Mesma lógica do sync interno (src/server/compras-sync.server.ts).
+#
+# Campos de atendimento parcial (qtd_rc / qtd_atendida_rc / qtd_pendente_rc):
+# somam TODOS os pedidos não cancelados do item da RC (join PQ) para que uma RC
+# atendida só em parte continue aparecendo como pendência no Painel de Compras.
 QUERY = """
 SELECT
   COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
@@ -67,7 +66,7 @@ SELECT
   ) AS ordem,
   TRIM(LEADING '0' FROM TRIM(E.MATNR)) AS cod_sap,
   COALESCE(M.MAKTX, E.TXZ01) AS descricao,
-  COALESCE(P.MENGE, E.MENGE) AS qtd_req,
+  CASE WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' OR COALESCE(P.MENGE,0) = 0 THEN E.MENGE ELSE P.MENGE END AS qtd_req,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(P.EBELN,''))),'') AS pedido,
   TRIM(COALESCE(CAST(P.EBELP AS VARCHAR), CAST(E.BNFPO AS VARCHAR))) AS num_operacao,
   NULLIF(TRIM(LEADING '0' FROM TRIM(E.BANFN)),'') AS num_rc,
@@ -98,7 +97,14 @@ SELECT
     ELSE 'Outro'
   END AS tipo_consumo,
   NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(PK.KOSTL, ACC.KOSTL, ''))),'') AS centro_custo,
+  E.MENGE AS qtd_rc,
+  COALESCE(PQ.qtd_pedida, 0) AS qtd_atendida_rc,
+  GREATEST(E.MENGE - COALESCE(PQ.qtd_pedida, 0), 0) AS qtd_pendente_rc,
   CASE
+    -- A exclusao da RC e soberana, mesmo quando existe historico de pedido,
+    -- aprovacao ou recebimento para o item.
+    WHEN TRIM(COALESCE(E.LOEKZ,'')) IN ('X','L')
+      AND (P.EBELN IS NULL OR TRIM(COALESCE(P.LOEKZ,'')) = 'L') THEN 'rc_excluida'
     WHEN COALESCE(H.qtd_recebida, 0) >= P.MENGE AND P.MENGE > 0
       THEN 'recebido'
     WHEN COALESCE(H.qtd_recebida, 0) > 0
@@ -106,13 +112,18 @@ SELECT
     WHEN K.FRGRL = 'X' THEN 'aguardando_aprovacao'
     WHEN P.EBELN IS NOT NULL AND COALESCE(TRIM(P.LOEKZ),'') <> 'L' THEN 'pedido_emitido'
     WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' THEN 'pedido_cancelado'
-    WHEN TRIM(COALESCE(E.LOEKZ,'')) = 'X' THEN 'rc_excluida'
     WHEN E.BANFN IS NOT NULL AND COALESCE(TRIM(P.EBELN),'') = '' THEN 'aguardando_pedido'
     ELSE 'verificar'
   END AS status_processo
 FROM EBAN AS E
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
+LEFT JOIN LATERAL (
+  SELECT SUM(P2.MENGE) AS qtd_pedida
+  FROM EKPO P2
+  WHERE P2.BANFN = E.BANFN AND P2.BNFPO = E.BNFPO
+    AND COALESCE(TRIM(P2.LOEKZ),'') <> 'L'
+) AS PQ ON TRUE
 LEFT JOIN LATERAL (
   SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
   FROM EBKN
@@ -141,15 +152,23 @@ LEFT JOIN LATERAL (
   WHERE MATNR = E.MATNR
     AND SPRAS IN ('P', 'PT')
 ) AS M ON TRUE
-WHERE (
-    E.EKGRP IN ('201', '220', '251')
-    OR K.EKGRP IN ('201', '220', '251')
-    OR K.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
+WHERE E.BANFN IN (
+    -- RC inteira entra quando pelo menos um item é do nosso escopo:
+    -- itens de outros grupos de compras da mesma RC não podem sumir.
+    SELECT E2.BANFN
+    FROM EBAN AS E2
+    LEFT JOIN EKPO AS P2 ON E2.BANFN = P2.BANFN AND E2.BNFPO = P2.BNFPO
+    LEFT JOIN EKKO AS K2 ON P2.EBELN = K2.EBELN
+    WHERE (
+        E2.EKGRP IN ('201', '220', '251')
+        OR K2.EKGRP IN ('201', '220', '251')
+        OR K2.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
+      )
+      AND E2.BADAT::date >= CURRENT_DATE - %(ini)s::int
+      AND E2.BADAT::date <= CURRENT_DATE - %(fim)s::int
   )
-  -- BADAT precisa de cast pra date: comparar como texto ('YYYYMMDD') derruba
-  -- as linhas gravadas no formato 'YYYY-MM-DD' e some com as RCs do dia.
-  AND E.BADAT::date >= CURRENT_DATE - %(ini)s::int
-  AND E.BADAT::date <= CURRENT_DATE - %(fim)s::int
+  -- Sem filtro de data no item: a janela vale so pra escolher a RC.
+  -- Filtrar o item por BADAT derrubava irmaos da mesma RC criados em outra data.
   AND TRIM(LEADING '0' FROM TRIM(E.MATNR)) <> ''
 ORDER BY E.BANFN ASC
 """
