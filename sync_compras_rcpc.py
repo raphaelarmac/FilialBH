@@ -126,12 +126,16 @@ SELECT
 FROM EBAN AS E
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
-LEFT JOIN LATERAL (
-  SELECT SUM(P2.MENGE) AS qtd_pedida
-  FROM EKPO P2
-  WHERE P2.BANFN = E.BANFN AND P2.BNFPO = E.BNFPO
-    AND COALESCE(TRIM(P2.LOEKZ),'') <> 'L'
-) AS PQ ON TRUE
+LEFT JOIN (
+  -- Soma dos pedidos NAO cancelados por item de RC, agregada UMA vez e ligada
+  -- por hash join (igual ao LEFT JOIN EKPO acima). Um LATERAL correlacionado
+  -- aqui varria a EKPO inteira por linha e derrubava a conexao da replica.
+  SELECT BANFN, BNFPO, SUM(MENGE) AS qtd_pedida
+  FROM EKPO
+  WHERE COALESCE(TRIM(LOEKZ),'') <> 'L'
+    AND COALESCE(TRIM(BANFN),'') <> ''
+  GROUP BY BANFN, BNFPO
+) AS PQ ON PQ.BANFN = E.BANFN AND PQ.BNFPO = E.BNFPO
 LEFT JOIN LATERAL (
   SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
   FROM EBKN
