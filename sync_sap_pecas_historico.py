@@ -8,24 +8,39 @@ e quantidade total — e envia para o webhook do app:
   POST {APP_BASE_URL}/api/public/hooks/sync-sap-pecas-historico
   Header: x-webhook-secret: {SYNC_WEBHOOK_SECRET}
   Body:   { "started_at": "...", "rows": [ {...}, ... ] }
+
+Resiliência à réplica do SAP (hot standby):
+  - A leitura é fatiada por semestre (queries mais curtas sofrem menos
+    cancelamento por "conflict with recovery").
+  - Cada fatia tem statement_timeout de 5 min: se a réplica estiver doente a
+    consulta é cortada em vez de ficar pendurada, e uma consulta deixada para
+    trás por um cancelamento morre sozinha no banco.
+  - Retry curto (3 tentativas, 10 s / 20 s) só para erro transitório da réplica.
+  - As fatias são SOMADAS aqui no Python antes do envio (ver consolidar()),
+    de modo que a linha enviada por (ativo, cod_sap) é o total desde 2024 —
+    o mesmo resultado que uma única query sem fatiamento daria.
 """
 from __future__ import annotations
 
 import json
 import os
-# Remove espacos/quebras de linha acidentais colados nos secrets do GitHub.
-for _k, _v in list(os.environ.items()):
-    if isinstance(_v, str) and _v != _v.strip():
-        os.environ[_k] = _v.strip()
-
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 import psycopg2
 import psycopg2.extras
+
+# Secrets colados no GitHub às vezes vêm com um espaço ou uma quebra de linha no
+# fim (um "enter" sobrando). Isso faz a autenticação no SAP falhar com
+# `password authentication failed for user "usuario\n"`. Removemos espaços e
+# quebras de TODAS as variáveis de ambiente antes de qualquer uso.
+for _k, _v in list(os.environ.items()):
+    if isinstance(_v, str) and _v != _v.strip():
+        os.environ[_k] = _v.strip()
 
 SAP_DB_HOST = os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or ""
 _p = os.environ.get("HANA_DB_PORT") or os.environ.get("SAP_DB_PORT")
@@ -110,13 +125,14 @@ def post_webhook(payload: dict) -> None:
         time.sleep(5 * attempt)
 
 
-def _is_recovery_conflict(err: Exception) -> bool:
-    """Réplica de leitura (hot standby) cancela queries longas durante replay do WAL."""
+def _erro_transitorio_replica(err: Exception) -> bool:
+    """Réplica de leitura (hot standby) cancela/derruba sessões durante o replay do WAL."""
     txt = str(err).lower()
     return (
         "conflict with recovery" in txt
         or "canceling statement due to conflict" in txt
         or "terminating connection due to conflict" in txt
+        or "server closed the connection unexpectedly" in txt
         or isinstance(err, psycopg2.errors.SerializationFailure)
     )
 
@@ -127,6 +143,10 @@ def _fetch_periodo_once(ini: str, fim: str) -> list[dict]:
         host=SAP_DB_HOST, port=SAP_DB_PORT, user=SAP_DB_USER,
         password=SAP_DB_PASSWORD, dbname=SAP_DB_NAME,
         connect_timeout=30,
+        application_name="sync_sap_pecas_historico",
+        # Limite de 5 min por fatia. Passou disso, a réplica está doente: corta
+        # em vez de pendurar, e nenhuma consulta fica órfã no banco.
+        options="-c statement_timeout=300000",
     )
     conn.autocommit = True
     try:
@@ -143,17 +163,17 @@ def _fetch_periodo_once(ini: str, fim: str) -> list[dict]:
             pass
 
 
-def _fetch_periodo(ini: str, fim: str, attempts: int = 8) -> list[dict]:
+def _fetch_periodo(ini: str, fim: str, attempts: int = 3) -> list[dict]:
     last = None
     for i in range(attempts):
         try:
             return _fetch_periodo_once(ini, fim)
         except Exception as e:
             last = e
-            if not _is_recovery_conflict(e) or i == attempts - 1:
+            if not _erro_transitorio_replica(e) or i == attempts - 1:
                 raise
-            wait = min(120, 15 * (i + 1))
-            print(f"! conflito com recovery na réplica SAP ({ini}..{fim}, tentativa {i + 1}/{attempts}); "
+            wait = 10 * (i + 1)
+            print(f"! réplica SAP cancelou/derrubou a leitura ({ini}..{fim}, tentativa {i + 1}/{attempts}); "
                   f"aguardando {wait}s e repetindo…", flush=True)
             time.sleep(wait)
     raise last
@@ -169,11 +189,80 @@ def _periodos() -> list[tuple[str, str]]:
     return out
 
 
+def _max_opt(a, b):
+    """MAX() com NULL: ignora None, como o MAX do SQL."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
+def _num(v):
+    """Normaliza para Decimal; None continua None (SUM de só NULLs é NULL no SQL)."""
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return v
+    return Decimal(str(v))
+
+
+def _soma_opt(a, b):
+    """SUM() com NULL: ignora None; se os dois forem None, fica None."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def consolidar(fatias: list[dict]) -> list[dict]:
+    """Soma as fatias por semestre em uma única linha por (ativo, cod_sap).
+
+    Cada OS pertence a um único semestre (filtro por AUFK.ERDAT), então somar
+    qtd_ocorrencias e qtd_total entre fatias reproduz exatamente o COUNT
+    DISTINCT / SUM que uma única query 2024..hoje daria. Os demais campos usam
+    MAX, igual ao SQL. Sem isso, a linha de um semestre sobrescrevia a do
+    anterior no app e a contagem ficava só com o último semestre.
+    """
+    acc: dict[tuple[str, str], dict] = {}
+    for r in fatias:
+        ativo = r.get("ativo")
+        cod = r.get("cod_sap")
+        if not ativo or not cod:
+            continue
+        key = (str(ativo), str(cod))
+        cur = acc.get(key)
+        if cur is None:
+            acc[key] = {
+                "ativo": ativo,
+                "descricao_ativo": r.get("descricao_ativo"),
+                "cod_sap": cod,
+                "descricao_componente": r.get("descricao_componente"),
+                "grupo_mercadoria": r.get("grupo_mercadoria"),
+                "qtd_ocorrencias": int(r.get("qtd_ocorrencias") or 0),
+                "qtd_total": _num(r.get("qtd_total")),
+                "ultima_ordem": r.get("ultima_ordem"),
+                "ultima_data": r.get("ultima_data"),
+            }
+            continue
+        cur["descricao_ativo"] = _max_opt(cur["descricao_ativo"], r.get("descricao_ativo"))
+        cur["descricao_componente"] = _max_opt(cur["descricao_componente"], r.get("descricao_componente"))
+        cur["grupo_mercadoria"] = _max_opt(cur["grupo_mercadoria"], r.get("grupo_mercadoria"))
+        cur["qtd_ocorrencias"] += int(r.get("qtd_ocorrencias") or 0)
+        cur["qtd_total"] = _soma_opt(cur["qtd_total"], _num(r.get("qtd_total")))
+        cur["ultima_ordem"] = _max_opt(cur["ultima_ordem"], r.get("ultima_ordem"))
+        cur["ultima_data"] = _max_opt(cur["ultima_data"], r.get("ultima_data"))
+    return list(acc.values())
+
+
 def fetch_sap_rows() -> list[dict]:
-    todas: list[dict] = []
+    fatias: list[dict] = []
     for ini, fim in _periodos():
-        todas.extend(_fetch_periodo(ini, fim))
-    print(f"total lido do SAP: {len(todas)} linhas", flush=True)
+        fatias.extend(_fetch_periodo(ini, fim))
+    print(f"total lido do SAP: {len(fatias)} linhas (fatias por semestre)", flush=True)
+    todas = consolidar(fatias)
+    print(f"consolidado por (ativo, cod_sap): {len(todas)} linhas", flush=True)
     return todas
 
 
