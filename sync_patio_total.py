@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib import request as urlrequest
@@ -657,25 +658,61 @@ def fetch_mysql(database: str, query: str, user: str, password: str, host: str, 
         conn.close()
 
 
-def fetch_postgres(database: str, query: str, user: str, password: str, host: str, port: int) -> list[dict]:
+def _erro_transitorio_replica(err: Exception) -> bool:
+    """A réplica do SAP (hot standby) cancela leituras longas enquanto aplica a
+    replicação ("conflict with recovery") ou simplesmente derruba a conexão.
+    São erros passageiros: vale esperar um pouco e tentar de novo — é o que o
+    sync_compras_rcpc e o sync_reservas_separacao já fazem."""
+    txt = str(err).lower()
+    return (
+        "conflict with recovery" in txt
+        or "canceling statement due to conflict" in txt
+        or "terminating connection due to conflict" in txt
+        or "server closed the connection unexpectedly" in txt
+    )
+
+
+def fetch_postgres(database: str, query: str, user: str, password: str, host: str, port: int,
+                   attempts: int = 3) -> list[dict]:
     if not _HAS_PG:
         raise RuntimeError("psycopg2 não instalado — adicione psycopg2-binary nas dependências")
-    conn = psycopg2.connect(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        dbname=database,
-        connect_timeout=20,
-        sslmode="require",
-        application_name="sync_patio_total",
-    )
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query)
-            return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
+    ultimo: Exception | None = None
+    for i in range(attempts):
+        conn = None
+        try:
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                dbname=database,
+                connect_timeout=20,
+                sslmode="require",
+                application_name="sync_patio_total",
+            )
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query)
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:  # noqa: BLE001
+            ultimo = e
+            # Só repete em erro passageiro da réplica; qualquer outro erro sobe na hora.
+            if not _erro_transitorio_replica(e) or i == attempts - 1:
+                raise
+            espera = 10 * (i + 1)
+            print(
+                f"  ! réplica cancelou/derrubou a leitura (tentativa {i + 1}/{attempts}); "
+                f"aguardando {espera}s e repetindo…",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(espera)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    raise ultimo  # type: ignore[misc]
 
 
 
