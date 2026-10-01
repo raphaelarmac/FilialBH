@@ -4,8 +4,12 @@ sync_patio_total.py (rev: detalhes-operacoes)
 
 Roda no GitHub Actions (.github/workflows/sync-patio.yml).
 
-Lê o MySQL da ARMAC (UCA + telemetria) e envia os registros via POST
-para os endpoints públicos do app na Lovable Cloud. O app cuida de
+Lê o MySQL da ARMAC (UCA + telemetria) e a réplica do SAP (OS e equipamentos)
+e envia os registros via POST para os endpoints públicos do app na Lovable Cloud.
+
+Suprimentos NÃO mora mais aqui:
+  - itens das OS (peças por ordem)  -> sync_os_suprimentos.py
+  - fluxo RC -> PC (compras)        -> sync_compras_rcpc.py O app cuida de
 todos os writes no Postgres — não precisamos da senha do banco.
 
 Variáveis de ambiente (GitHub Secrets):
@@ -239,237 +243,6 @@ ORDER BY numero_armac;
 """
 
 
-SUPRIMENTOS_QUERY = """
-WITH ultima_os AS (
-    SELECT
-        n_equipamento AS ativo,
-        TRIM(LEADING '0' FROM n_ordem) AS ordem_tratada,
-        LPAD(TRIM(n_ordem), 12, '0') AS ordem_sap
-    FROM (
-        SELECT
-            n_equipamento,
-            n_ordem,
-            ROW_NUMBER() OVER(
-                PARTITION BY n_equipamento,
-                CASE
-                    WHEN cod_tipo_atividade = 'PRP' OR tipo_atividade ILIKE '%%prep%%' THEN 'Preparação'
-                    WHEN cod_tipo_atividade = 'OFI' OR tipo_atividade ILIKE '%%ofi%%' THEN 'Oficina'
-                END
-                ORDER BY data_criacao DESC
-            ) as rn
-        FROM pm_ordem_manutencao_cabecalho_v2
-        WHERE (cod_centro_trabalho LIKE '%%BHZ%%' OR cod_centro_trabalho LIKE '%%BET%%')
-          AND data_criacao >= '2024-01-01'
-          AND (cod_tipo_atividade IN ('PRP', 'OFI') OR tipo_atividade ILIKE '%%prep%%' OR tipo_atividade ILIKE '%%ofi%%')
-    ) sub
-    WHERE rn = 1
-),
-itens_brutos AS (
-    SELECT
-        os.ativo,
-        os.ordem_tratada AS ordem,
-        LTRIM(TRIM(E.MATNR), '0') AS cod_sap,
-        E.TXZ01 AS desc_compra_direta,
-        E.MENGE AS qtd_req,
-        LTRIM(TRIM(P.EBELN), '0') AS pedido,
-        CAST(NULL AS VARCHAR) AS num_reserva,
-        'compra'::text AS origem,
-        E.KNTTP AS knttp,
-        TRIM(COALESCE(RX.VORNR, '')) AS num_operacao
-    FROM ultima_os os
-    JOIN EBKN ACC ON ACC.AUFNR = os.ordem_sap
-    JOIN EBAN E   ON E.BANFN = ACC.BANFN AND E.BNFPO = ACC.BNFPO
-    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO AND COALESCE(TRIM(P.LOEKZ),'') <> 'L'
-    LEFT JOIN LATERAL (
-        SELECT MAX(TRIM(R2.VORNR)) AS VORNR
-        FROM RESB R2
-        WHERE R2.AUFNR = os.ordem_sap
-          AND LTRIM(TRIM(R2.MATNR), '0') = LTRIM(TRIM(E.MATNR), '0')
-          AND TRIM(COALESCE(R2.VORNR,'')) <> ''
-    ) RX ON TRUE
-
-
-    UNION ALL
-
-    SELECT
-        os.ativo,
-        os.ordem_tratada AS ordem,
-        LTRIM(TRIM(R.MATNR), '0') AS cod_sap,
-        CAST(NULL AS VARCHAR) AS desc_compra_direta,
-        R.BDMNG AS qtd_req,
-        LTRIM(TRIM(P.EBELN), '0') AS pedido,
-        CASE
-            WHEN R.POSTP = 'N' THEN CAST(NULL AS VARCHAR)
-            ELSE LTRIM(TRIM(R.RSNUM), '0')
-        END AS num_reserva,
-        CASE
-            WHEN R.POSTP = 'N' THEN 'compra'::text
-            ELSE 'reserva'::text
-        END AS origem,
-        E.KNTTP AS knttp,
-        TRIM(COALESCE(OPR.VORNR, R.VORNR, '')) AS num_operacao
-    FROM ultima_os os
-    JOIN RESB R   ON R.AUFNR = os.ordem_sap
-    LEFT JOIN EBAN E ON E.BANFN = R.BANFN AND E.BNFPO = R.BNFPO
-    LEFT JOIN EKPO P ON P.BANFN = E.BANFN AND P.BNFPO = E.BNFPO AND COALESCE(TRIM(P.LOEKZ),'') <> 'L'
-    LEFT JOIN AFVC OPR ON OPR.AUFPL = R.AUFPL AND OPR.APLZL = R.APLZL
-    WHERE (R.XLOEK IS NULL OR TRIM(R.XLOEK) = '')
-),
-itens_deduplicados AS (
-    SELECT
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY ordem, cod_sap, num_operacao, origem
-            ORDER BY
-                CASE WHEN pedido IS NOT NULL THEN 1 ELSE 2 END,
-                CASE WHEN num_reserva IS NOT NULL THEN 1 ELSE 2 END
-        ) AS rn
-    FROM itens_brutos
-    WHERE cod_sap IS NOT NULL AND cod_sap <> ''
-)
-SELECT
-    itens.ativo         AS ativo,
-    itens.ordem         AS ordem,
-    itens.cod_sap       AS cod_sap,
-    COALESCE(M.MAKTX, itens.desc_compra_direta, 'Sem Descrição') AS descricao,
-    itens.qtd_req       AS qtd_req,
-    itens.num_reserva   AS num_reserva,
-    itens.pedido        AS pedido,
-    itens.origem        AS origem,
-    itens.num_operacao  AS num_operacao,
-    NULLIF(TRIM(COALESCE(itens.knttp,'')),'') AS knttp,
-    CASE
-        WHEN COALESCE(TRIM(itens.knttp),'') = '' THEN 'estoque'
-        WHEN TRIM(itens.knttp) = 'K' THEN 'centro_custo'
-        ELSE 'consumo'
-    END AS destinacao
-FROM itens_deduplicados itens
-LEFT JOIN MAKT M ON LTRIM(TRIM(M.MATNR), '0') = itens.cod_sap AND M.SPRAS IN ('P', 'PT')
-WHERE itens.rn = 1
-ORDER BY itens.ativo, itens.ordem, itens.num_operacao;
-
-"""
-
-
-# Fluxo completo RC -> PC dos grupos de compradores da filial (201/220/251)
-# e dos compradores nominais. Cobre pedidos com OS (ativo do equipamento) e
-# pedidos de estoque/centro de custo (ativo 'ESTOQUE').
-SUPRIMENTOS_COMPRAS_QUERY = """
-SELECT
-  COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
-  COALESCE(
-    NULLIF(TRIM(LEADING '0' FROM TRIM(ACC.AUFNR)),''),
-    NULLIF('PC-' || TRIM(LEADING '0' FROM TRIM(COALESCE(P.EBELN,''))), 'PC-'),
-    'RC-' || TRIM(LEADING '0' FROM TRIM(E.BANFN))
-  ) AS ordem,
-  TRIM(LEADING '0' FROM TRIM(E.MATNR)) AS cod_sap,
-  COALESCE(M.MAKTX, E.TXZ01) AS descricao,
-  CASE WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' OR COALESCE(P.MENGE,0) = 0 THEN E.MENGE ELSE P.MENGE END AS qtd_req,
-  NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(P.EBELN,''))),'') AS pedido,
-  CAST(NULL AS VARCHAR) AS num_reserva,
-  'compra'::text AS origem,
-  TRIM(COALESCE(CAST(P.EBELP AS VARCHAR), CAST(E.BNFPO AS VARCHAR))) AS num_operacao,
-  NULLIF(TRIM(LEADING '0' FROM TRIM(E.BANFN)),'') AS num_rc,
-  CAST(E.BNFPO AS VARCHAR) AS item_rc,
-  COALESCE(K.ERNAM, E.EKGRP) AS comprador,
-  E.ERNAM AS criado_por_sap,
-  E.BADAT AS data_requisicao,
-  NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(K.LIFNR,''))),'') AS fornecedor_cod,
-  VEND.NAME1 AS fornecedor_nome,
-  K.BEDAT AS data_emissao_pc,
-  SCH.data_remessa AS data_remessa_pc,
-  COALESCE(P.NETPR, E.PREIS) AS vlr_unit,
-  COALESCE(P.NETWR, E.MENGE * E.PREIS) AS vlr_total,
-  NULLIF(TRIM(COALESCE(P.KNTTP, E.KNTTP, '')),'') AS knttp,
-  CASE
-    WHEN COALESCE(TRIM(COALESCE(P.KNTTP, E.KNTTP, '')),'') = '' THEN 'estoque'
-    WHEN TRIM(COALESCE(P.KNTTP, E.KNTTP)) = 'K' THEN 'centro_custo'
-    ELSE 'consumo'
-  END AS destinacao,
-  CASE TRIM(COALESCE(P.KNTTP, E.KNTTP, ''))
-    WHEN 'K' THEN 'Centro de Custo'
-    WHEN 'A' THEN 'Ativo Fixo (Imobilizado)'
-    WHEN 'F' THEN 'Ordem (Manutencao/Interna)'
-    WHEN 'P' THEN 'Projeto (PEP)'
-    WHEN 'Q' THEN 'Projeto (PEP)'
-    WHEN 'N' THEN 'Rede'
-    WHEN ''  THEN 'Estoque'
-    ELSE 'Outro'
-  END AS tipo_consumo,
-  NULLIF(TRIM(LEADING '0' FROM TRIM(COALESCE(PK.KOSTL, ACC.KOSTL, ''))),'') AS centro_custo,
-  CASE
-    -- A exclusao da RC e soberana, mesmo quando existe historico de pedido,
-    -- aprovacao ou recebimento para o item.
-    WHEN TRIM(COALESCE(E.LOEKZ,'')) IN ('X','L')
-      AND (P.EBELN IS NULL OR TRIM(COALESCE(P.LOEKZ,'')) = 'L') THEN 'rc_excluida'
-    WHEN COALESCE(H.qtd_recebida, 0) >= P.MENGE AND P.MENGE > 0
-      THEN 'recebido'
-    WHEN COALESCE(H.qtd_recebida, 0) > 0
-      THEN 'entrega_parcial'
-    WHEN K.FRGRL = 'X' THEN 'aguardando_aprovacao'
-    WHEN P.EBELN IS NOT NULL AND COALESCE(TRIM(P.LOEKZ),'') <> 'L' THEN 'pedido_emitido'
-    WHEN TRIM(COALESCE(P.LOEKZ,'')) = 'L' THEN 'pedido_cancelado'
-    WHEN E.BANFN IS NOT NULL AND COALESCE(TRIM(P.EBELN),'') = '' THEN 'aguardando_pedido'
-    ELSE 'verificar'
-  END AS status_processo
-FROM EBAN AS E
-LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
-LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
-LEFT JOIN LATERAL (
-  SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
-  FROM EBKN
-  WHERE BANFN = E.BANFN AND BNFPO = E.BNFPO
-) AS ACC ON TRUE
-LEFT JOIN LATERAL (
-  SELECT MAX(KOSTL) AS KOSTL
-  FROM EKKN
-  WHERE EBELN = P.EBELN AND EBELP = P.EBELP
-) AS PK ON TRUE
-LEFT JOIN AFIH AS A ON ACC.AUFNR = A.AUFNR
-LEFT JOIN LFA1 AS VEND ON K.LIFNR = VEND.LIFNR
-LEFT JOIN LATERAL (
-  SELECT SUM(MENGE) AS qtd_recebida
-  FROM EKBE
-  WHERE EBELN = P.EBELN AND EBELP = P.EBELP AND VGABE = '1'
-) AS H ON TRUE
-LEFT JOIN LATERAL (
-  SELECT MIN(EINDT) AS data_remessa
-  FROM EKET
-  WHERE EBELN = P.EBELN AND EBELP = P.EBELP
-) AS SCH ON TRUE
-LEFT JOIN LATERAL (
-  SELECT MAX(MAKTX) AS MAKTX
-  FROM MAKT
-  WHERE MATNR = E.MATNR
-    AND SPRAS IN ('P', 'PT')
-) AS M ON TRUE
-WHERE (
-    E.EKGRP IN ('201', '220', '251')
-    OR K.EKGRP IN ('201', '220', '251')
-    OR K.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
-  )
-  AND E.BADAT >= TO_CHAR(CURRENT_DATE - __DIAS_INICIO__, 'YYYYMMDD')
-  AND E.BADAT <= TO_CHAR(CURRENT_DATE - __DIAS_FIM__, 'YYYYMMDD')
-  AND TRIM(LEADING '0' FROM TRIM(E.MATNR)) <> ''
-ORDER BY E.BANFN ASC;
-"""
-
-
-def suprimentos_compras_query(dias_inicio: int, dias_fim: int) -> str:
-    return (
-        SUPRIMENTOS_COMPRAS_QUERY
-        .replace("__DIAS_INICIO__", str(int(dias_inicio)))
-        .replace("__DIAS_FIM__", str(int(dias_fim)))
-    )
-
-
-
-
-
-
-
-
-
 UCA_QUERY = """
     SELECT
         UPPER(TRIM(Atual.n_armac))   AS n_armac,
@@ -689,10 +462,11 @@ def fetch_postgres(database: str, query: str, user: str, password: str, host: st
                 connect_timeout=20,
                 sslmode="require",
                 application_name="sync_patio_total",
-                # Limite de 10 min por consulta (igual ao sync_compras_rcpc). Sem isso
-                # uma leitura lenta fica pendurada indefinidamente na replica, segura
-                # os blocos seguintes e ainda deixa a replica lenta pros outros robos.
-                options="-c statement_timeout=600000",
+                # Limite de 3 min por consulta. Em replica normal essas leituras levam
+                # segundos (Suprimentos ~1 min); se passar disso a replica esta doente
+                # e nao vale pendurar o run: corta, o bloco falha, e o robo segue pros
+                # proximos (UCA/SAP ja gravaram). Tenta de novo na proxima hora.
+                options="-c statement_timeout=180000",
             )
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(query)
@@ -924,100 +698,6 @@ def main() -> int:
     else:
         print("[EQUIP] pulado · HANA_DB_* não configurado", flush=True)
         summary["equipamentos"] = {"ok": True, "skipped": True}
-
-    # --- SUPRIMENTOS (itens das OS no mesmo HANA) ---
-    if SAP_ENABLED:
-        started_at = now_utc_iso()
-        try:
-            rows = fetch_postgres(SAP_DB_NAME, SUPRIMENTOS_QUERY, SAP_DB_USER, SAP_DB_PASSWORD, SAP_DB_HOST, SAP_DB_PORT)
-            rows_payload = [to_payload(r) for r in rows]
-            payload = {"started_at": started_at, "rows": rows_payload}
-
-            result = post_json("/api/public/hooks/sync-suprimentos-data", payload)
-            if not result.get("ok"):
-                raise RuntimeError(f"app respondeu sem ok: {result}")
-            summary["suprimentos"] = result
-            print(f"[SUPR] ok · {result.get('message') or result}", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            summary["suprimentos"] = {"ok": False, "error": str(exc)}
-            print(f"[SUPR] erro · {exc}", file=sys.stderr, flush=True)
-            report_failure("/api/public/hooks/sync-suprimentos-data", started_at, exc)
-            exit_code = 1
-    else:
-        print("[SUPR] pulado · HANA_DB_* não configurado", flush=True)
-        summary["suprimentos"] = {"ok": True, "skipped": True}
-
-    # --- SUPRIMENTOS COMPRAS (fluxo RC -> PC, alimenta Validação de Pedidos) ---
-    if SAP_ENABLED:
-        started_at = now_utc_iso()
-        try:
-            rows_por_item: dict[tuple[str, str], dict] = {}
-            falhas_janelas: list[str] = []
-            janelas_ok = 0
-            for dias_inicio in range(180, 0, -14):
-                dias_fim = max(0, dias_inicio - 14)
-                janela_rows: list[dict] | None = None
-                ultimo_erro: Exception | None = None
-                for tentativa in range(1, 4):
-                    try:
-                        janela_rows = fetch_postgres(
-                            SAP_DB_NAME,
-                            suprimentos_compras_query(dias_inicio, dias_fim),
-                            SAP_DB_USER,
-                            SAP_DB_PASSWORD,
-                            SAP_DB_HOST,
-                            SAP_DB_PORT,
-                        )
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        ultimo_erro = exc
-                        print(
-                            f"[COMPRAS] janela {dias_inicio}..{dias_fim} tentativa {tentativa}/3 falhou · {exc}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                if janela_rows is None:
-                    falhas_janelas.append(
-                        f"{dias_inicio}..{dias_fim}: {ultimo_erro or 'sem detalhe'}"
-                    )
-                    continue
-                janelas_ok += 1
-                for row in janela_rows:
-                    chave = (
-                        str(row.get("num_rc") or "").strip(),
-                        str(row.get("item_rc") or "").strip(),
-                    )
-                    if all(chave):
-                        rows_por_item[chave] = row
-
-            if janelas_ok == 0:
-                raise RuntimeError(
-                    "todas as janelas RC/PC falharam: "
-                    + (falhas_janelas[0] if falhas_janelas else "sem detalhe")
-                )
-
-            rows = list(rows_por_item.values())
-            payload = {"started_at": started_at, "rows": [to_payload(r) for r in rows]}
-            result = post_json("/api/public/hooks/sync-suprimentos-compras", payload)
-            if not result.get("ok"):
-                raise RuntimeError(f"app respondeu sem ok: {result}")
-            summary["suprimentos_compras"] = result
-            aviso = (
-                f" · {len(falhas_janelas)} janela(s) serão refeitas na próxima execução"
-                if falhas_janelas else ""
-            )
-            print(
-                f"[COMPRAS] ok · {len(rows)} itens RC/PC{aviso} · {result.get('message') or result}",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            summary["suprimentos_compras"] = {"ok": False, "error": str(exc)}
-            print(f"[COMPRAS] erro · {exc}", file=sys.stderr, flush=True)
-            report_failure("/api/public/hooks/sync-suprimentos-compras", started_at, exc)
-            exit_code = 1
-    else:
-        print("[COMPRAS] pulado · HANA_DB_* não configurado", flush=True)
-        summary["suprimentos_compras"] = {"ok": True, "skipped": True}
 
     print(json.dumps(summary, default=str), flush=True)
     return exit_code
