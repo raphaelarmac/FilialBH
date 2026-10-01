@@ -30,6 +30,14 @@ from urllib.error import HTTPError, URLError
 import psycopg2
 import psycopg2.extras
 
+# Secrets colados no GitHub às vezes vêm com um espaço ou uma quebra de linha no
+# fim (um "enter" sobrando). Isso faz a autenticação no SAP falhar com
+# `password authentication failed for user "usuario\n"`. Removemos espaços e
+# quebras de TODAS as variáveis de ambiente antes de qualquer uso.
+for _k, _v in list(os.environ.items()):
+    if isinstance(_v, str) and _v != _v.strip():
+        os.environ[_k] = _v.strip()
+
 DB_HOST = os.environ.get("HANA_DB_HOST") or os.environ.get("SAP_DB_HOST") or ""
 _p = os.environ.get("HANA_DB_PORT") or os.environ.get("SAP_DB_PORT")
 DB_PORT = int(_p) if _p else 5432
@@ -197,7 +205,10 @@ def conectar():
         dbname=DB_NAME,
         connect_timeout=30,
         sslmode=os.environ.get("HANA_DB_SSLMODE") or "prefer",
-        options="-c statement_timeout=600000",
+        # Limite de 5 min por janela (normal e ~30 s). Passou disso, a replica
+        # esta doente: corta em vez de pendurar, e qualquer query deixada para
+        # tras por um cancelamento morre sozinha no banco em 5 min.
+        options="-c statement_timeout=300000",
     )
 
 
