@@ -689,6 +689,10 @@ def fetch_postgres(database: str, query: str, user: str, password: str, host: st
                 connect_timeout=20,
                 sslmode="require",
                 application_name="sync_patio_total",
+                # Limite de 10 min por consulta (igual ao sync_compras_rcpc). Sem isso
+                # uma leitura lenta fica pendurada indefinidamente na replica, segura
+                # os blocos seguintes e ainda deixa a replica lenta pros outros robos.
+                options="-c statement_timeout=600000",
             )
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(query)
