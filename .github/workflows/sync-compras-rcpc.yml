@@ -5,6 +5,13 @@ name: Sync Compras RC→PC (SAP)
 #
 # Secrets: HANA_DB_HOST/PORT/USER/PASSWORD/NAME (ou SAP_DB_*),
 #          SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional)
+#
+# Resiliência à réplica (hot standby):
+#   - COMPRAS_JANELA=7: consultas de 7 dias em vez de 14 — metade das linhas por
+#     consulta, consulta mais curta, menos chance de ser cancelada por
+#     "conflict with recovery" durante replicação pesada. Mesmo trabalho total.
+#   - timeout-minutes 15: um run normal leva ~7 min; passou de 15 é réplica
+#     doente — o GitHub mata e libera a fila em vez de segurar 45 min.
 
 on:
   schedule:
@@ -23,7 +30,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +58,7 @@ jobs:
           SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           COMPRAS_DIAS: ${{ github.event.inputs.dias }}
+          COMPRAS_JANELA: "7"
         run: python -u sync_compras_rcpc.py
 
       - name: Notificar falha ao app
