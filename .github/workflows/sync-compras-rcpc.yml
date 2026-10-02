@@ -8,15 +8,17 @@ name: Sync Compras RC→PC (SAP)
 # Secrets: HANA_DB_HOST/PORT/USER/PASSWORD/NAME (ou SAP_DB_*),
 #          SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional)
 #
-# Janela de leitura: padrão do script (COMPRAS_JANELA=14 dias) — é a
-# configuração que roda estável. Não reduza a janela sem medir antes: o custo
-# da consulta é quase todo fixo (varreduras de EBAN/EKPO), então fatias
-# menores = mais fatias = mais trabalho, e um filtro de data mais estreito pode
-# levar o planner a um plano ruim (nested loop em EKPO).
+# Janela de leitura (COMPRAS_JANELA, abaixo): o custo de cada consulta é quase
+# todo fixo (varreduras completas de EBAN/EKPO), independente de a fatia ter 14
+# ou 180 dias. Por isso fatias MAIORES = menos consultas = run mais curto.
+#   14 dias -> 13 consultas por run (~17 min em 02/10)
+#   60 dias ->  3 consultas por run
+# Se uma fatia de 60 dias passar a ser cancelada direto pela réplica
+# ("conflict with recovery" 4x seguidas na mesma fatia), volte para "30".
 
 on:
   schedule:
-    - cron: "15 * * * *"
+    - cron: "35 * * * *"
   workflow_dispatch:
     inputs:
       dias:
@@ -59,6 +61,8 @@ jobs:
           SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           COMPRAS_DIAS: ${{ github.event.inputs.dias }}
+          # Fatias de 60 dias (3 consultas por run). Ver nota no topo do arquivo.
+          COMPRAS_JANELA: "60"
         run: python -u sync_compras_rcpc.py
 
       # failure() cobre erro do script; cancelled() cobre o GitHub matando o job
