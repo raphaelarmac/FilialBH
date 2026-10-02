@@ -2,20 +2,21 @@ name: Sync Compras RC→PC (SAP)
 
 # Extrai o fluxo de compras RC -> PC do SAP e envia ao webhook do app.
 # Roda de hora em hora (mais estável que o Worker, que estoura tempo/conexão).
+# Além do cron, o pg_cron do app dispara este workflow a cada 10 min
+# (cron-dispatch -> workflow_dispatch).
 #
 # Secrets: HANA_DB_HOST/PORT/USER/PASSWORD/NAME (ou SAP_DB_*),
 #          SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional)
 #
-# Resiliência à réplica (hot standby):
-#   - COMPRAS_JANELA=7: consultas de 7 dias em vez de 14 — metade das linhas por
-#     consulta, consulta mais curta, menos chance de ser cancelada por
-#     "conflict with recovery" durante replicação pesada. Mesmo trabalho total.
-#   - timeout-minutes 15: um run normal leva ~7 min; passou de 15 é réplica
-#     doente — o GitHub mata e libera a fila em vez de segurar 45 min.
+# Janela de leitura: padrão do script (COMPRAS_JANELA=14 dias) — é a
+# configuração que roda estável. Não reduza a janela sem medir antes: o custo
+# da consulta é quase todo fixo (varreduras de EBAN/EKPO), então fatias
+# menores = mais fatias = mais trabalho, e um filtro de data mais estreito pode
+# levar o planner a um plano ruim (nested loop em EKPO).
 
 on:
   schedule:
-    - cron: "35 * * * *"
+    - cron: "15 * * * *"
   workflow_dispatch:
     inputs:
       dias:
@@ -30,7 +31,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -58,17 +59,19 @@ jobs:
           SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
           COMPRAS_DIAS: ${{ github.event.inputs.dias }}
-          COMPRAS_JANELA: "7"
         run: python -u sync_compras_rcpc.py
 
+      # failure() cobre erro do script; cancelled() cobre o GitHub matando o job
+      # por timeout-minutes — sem isso a morte por timeout não aparece no painel.
       - name: Notificar falha ao app
-        if: failure()
+        if: failure() || cancelled()
         env:
           SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
           APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          MOTIVO: ${{ job.status == 'cancelled' && 'cancelado/timeout' || 'falhou' }}
         run: |
           BASE="${APP_BASE_URL:-https://gestaofilialbh.lovable.app}"
           curl -sS -X POST "${BASE%/}/api/public/hooks/sync-compras-rcpc" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: $SYNC_WEBHOOK_SECRET" \
-            -d "{\"error\":\"Workflow GitHub Actions falhou (run ${GITHUB_RUN_ID})\"}" || true
+            -d "{\"error\":\"Workflow GitHub Actions ${MOTIVO} (run ${GITHUB_RUN_ID})\"}" || true
