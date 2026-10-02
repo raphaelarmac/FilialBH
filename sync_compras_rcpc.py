@@ -16,6 +16,12 @@ Env necessárias:
   HANA_DB_HOST/PORT/USER/PASSWORD/NAME (ou SAP_DB_*)
   SYNC_WEBHOOK_SECRET, APP_BASE_URL (opcional)
   COMPRAS_DIAS (opcional, padrão 180), COMPRAS_JANELA (opcional, padrão 14)
+
+Plano de execucao (02/10/2026): a selecao das RCs da janela ("E.BANFN IN (...)")
+virou uma CTE MATERIALIZED + JOIN. Mesmo resultado; obriga o Postgres a filtrar
+as RCs ANTES dos JOINs laterais. Sem isso, apos a virada de mes o planner passou
+a processar EBAN inteira (806 mil itens) e filtrar por ultimo — custo de bilhoes,
+e nenhuma fatia terminava (ver EXPLAIN de 02/10 no historico do chat).
 """
 from __future__ import annotations
 
@@ -61,6 +67,23 @@ if not WEBHOOK_SECRET:
 
 # Mesma lógica do sync interno (src/server/compras-sync.server.ts).
 QUERY = """
+-- Lista de RCs da janela, calculada PRIMEIRO e materializada: o planner e
+-- obrigado a filtrar EBAN por essas RCs antes de fazer qualquer LATERAL.
+WITH rcs AS MATERIALIZED (
+    -- RC inteira entra quando pelo menos um item é do nosso escopo:
+    -- itens de outros grupos de compras da mesma RC não podem sumir.
+    SELECT DISTINCT E2.BANFN
+    FROM EBAN AS E2
+    LEFT JOIN EKPO AS P2 ON E2.BANFN = P2.BANFN AND E2.BNFPO = P2.BNFPO
+    LEFT JOIN EKKO AS K2 ON P2.EBELN = K2.EBELN
+    WHERE (
+        E2.EKGRP IN ('201', '220', '251')
+        OR K2.EKGRP IN ('201', '220', '251')
+        OR K2.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
+      )
+      AND E2.BADAT::date >= CURRENT_DATE - %(ini)s::int
+      AND E2.BADAT::date <= CURRENT_DATE - %(fim)s::int
+)
 SELECT
   COALESCE(NULLIF(TRIM(LEADING '0' FROM TRIM(A.EQUNR)),''), 'ESTOQUE') AS ativo,
   COALESCE(
@@ -117,6 +140,8 @@ SELECT
     ELSE 'verificar'
   END AS status_processo
 FROM EBAN AS E
+-- Troca do IN (subquery) por JOIN na lista de RCs já calculada (mesmo resultado).
+JOIN rcs ON rcs.BANFN = E.BANFN
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
 LEFT JOIN LATERAL (
@@ -147,24 +172,10 @@ LEFT JOIN LATERAL (
   WHERE MATNR = E.MATNR
     AND SPRAS IN ('P', 'PT')
 ) AS M ON TRUE
-WHERE E.BANFN IN (
-    -- RC inteira entra quando pelo menos um item é do nosso escopo:
-    -- itens de outros grupos de compras da mesma RC não podem sumir.
-    SELECT E2.BANFN
-    FROM EBAN AS E2
-    LEFT JOIN EKPO AS P2 ON E2.BANFN = P2.BANFN AND E2.BNFPO = P2.BNFPO
-    LEFT JOIN EKKO AS K2 ON P2.EBELN = K2.EBELN
-    WHERE (
-        E2.EKGRP IN ('201', '220', '251')
-        OR K2.EKGRP IN ('201', '220', '251')
-        OR K2.ERNAM IN ('GF.RODRIGUES', 'JO.XAVIER', 'GA.SILVEIRA', 'DS.QUARESMA')
-      )
-      AND E2.BADAT::date >= CURRENT_DATE - %(ini)s::int
-      AND E2.BADAT::date <= CURRENT_DATE - %(fim)s::int
-  )
+WHERE
   -- Sem filtro de data no item: a janela vale so pra escolher a RC.
   -- Filtrar o item por BADAT derrubava irmaos da mesma RC criados em outra data.
-  AND TRIM(LEADING '0' FROM TRIM(E.MATNR)) <> ''
+  TRIM(LEADING '0' FROM TRIM(E.MATNR)) <> ''
 ORDER BY E.BANFN ASC
 """
 
@@ -205,10 +216,10 @@ def conectar():
         dbname=DB_NAME,
         connect_timeout=30,
         sslmode=os.environ.get("HANA_DB_SSLMODE") or "prefer",
-        # Limite de 5 min por janela (normal e ~30 s). Passou disso, a replica
+        # Limite de 10 min por janela (normal e ~30 s). Passou disso, a replica
         # esta doente: corta em vez de pendurar, e qualquer query deixada para
-        # tras por um cancelamento morre sozinha no banco em 5 min.
-        options="-c statement_timeout=300000",
+        # tras por um cancelamento morre sozinha no banco em 10 min.
+        options="-c statement_timeout=600000",
     )
 
 
