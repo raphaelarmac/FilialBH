@@ -143,6 +143,7 @@ FROM EBAN AS E
 -- Troca do IN (subquery) por JOIN na lista de RCs já calculada (mesmo resultado).
 JOIN rcs ON rcs.BANFN = E.BANFN
 LEFT JOIN EKPO AS P ON E.BANFN = P.BANFN AND E.BNFPO = P.BNFPO
+  AND TRIM(COALESCE(P.LOEKZ,'')) NOT IN ('L','X')
 LEFT JOIN EKKO AS K ON P.EBELN = K.EBELN
 LEFT JOIN LATERAL (
   SELECT MAX(AUFNR) AS AUFNR, MAX(KOSTL) AS KOSTL
@@ -293,7 +294,9 @@ def main() -> None:
             cod_sap = (r.get("cod_sap") or "").strip()
             if not num_rc or not item_rc or not cod_sap:
                 continue
-            chave = f"{num_rc}::{item_rc}"
+            pedido = str(r.get("pedido") or "").strip()
+            item_pc = str(r.get("num_operacao") or "").strip()
+            chave = f"{num_rc}::{item_rc}::{pedido}/{item_pc}"
             if chave in vistos:
                 continue
             vistos.add(chave)
