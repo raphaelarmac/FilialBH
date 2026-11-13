@@ -1,0 +1,30 @@
+name: Sync App de Movimentação → Chegada/Saída BH
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-app-mov
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install PyMySQL==1.1.1
+      - name: Run sync_app_mov_bh.py
+        env:
+          ARMAC_DB_HOST: ${{ secrets.ARMAC_DB_HOST }}
+          ARMAC_DB_PORT: ${{ secrets.ARMAC_DB_PORT }}
+          ARMAC_DB_USER: ${{ secrets.ARMAC_DB_USER }}
+          ARMAC_DB_PASSWORD: ${{ secrets.ARMAC_DB_PASSWORD }}
+          SYNC_WEBHOOK_SECRET: ${{ secrets.SYNC_WEBHOOK_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: python -u sync_app_mov_bh.py
