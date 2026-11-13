@@ -9,12 +9,12 @@ import json, os, sys
 from urllib import request as rq
 import pymysql
 
-H = os.environ.get("UCA_DB_HOST") or os.environ.get("ARMAC_DB_HOST")
-U = os.environ.get("UCA_DB_USER") or os.environ.get("ARMAC_DB_USER")
-P = os.environ.get("UCA_DB_PASSWORD") or os.environ.get("ARMAC_DB_PASSWORD")
+H = (os.environ.get("UCA_DB_HOST") or os.environ.get("ARMAC_DB_HOST") or "").strip()
+U = (os.environ.get("UCA_DB_USER") or os.environ.get("ARMAC_DB_USER") or "").strip()
+P = (os.environ.get("UCA_DB_PASSWORD") or os.environ.get("ARMAC_DB_PASSWORD") or "").strip()
 PORT = int(os.environ.get("UCA_DB_PORT") or os.environ.get("ARMAC_DB_PORT") or 3306)
-BASE = (os.environ.get("APP_BASE_URL") or "https://gestaofilialbh.lovable.app").rstrip("/")
-SECRET = os.environ.get("SYNC_WEBHOOK_SECRET")
+BASE = (os.environ.get("APP_BASE_URL") or "https://gestaofilialbh.lovable.app").strip().rstrip("/")
+SECRET = (os.environ.get("SYNC_WEBHOOK_SECRET") or "").strip()
 if not (H and U and P and SECRET):
     print("ERRO: secrets ausentes", file=sys.stderr); sys.exit(2)
 
